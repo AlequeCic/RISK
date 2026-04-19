@@ -23,9 +23,9 @@ class Player:
     id: int
     name: str
     color: str
-    cards: List[Card] = field(default_factory=list)
     troops: int
-
+    cards: List[Card] = field(default_factory=list)
+    
 class Dice:
     def __init__(self, color):
         self.color = color

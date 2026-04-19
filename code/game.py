@@ -7,8 +7,9 @@ class Game:
     def __init__(self,map_data: dict, max_players: int = 3):
         #initialization of map, states, players and variables
         self.max_players = max_players
-        self.players = Dict[int,Player] = {}
+        self.players: Dict[int, Player] = {}
         self.territories: Dict[str, Territory] = {}
+        self._territory_aliases: Dict[str, str] = {}
         #self.pack = List[Card] = {}
 
         #turn
@@ -44,10 +45,18 @@ class Game:
     def load_map(self, map_data: dict):
         for name, data in map_data.items():
             self.territories[name] = Territory(
+                id = data["id"],
                 name = name,
                 continent=data["continent"],
-                neighbors=data["neighbors"]
+                neighbors=data["neighbors"],
+                troops=0
             )
+            self._territory_aliases[name.strip().lower()] = name
+
+    def _canonical_territory_name(self, territory_name: str):
+        if territory_name is None:
+            return None
+        return self._territory_aliases.get(territory_name.strip().lower())
 
     def start_match(self):
         player_count = len(self.players)
@@ -77,6 +86,9 @@ class Game:
         #distribute the territories
         self.distribute_initial_territories()
 
+        # setup phase starts right after match initialization
+        self.current_state = GameState.SETUP
+
         return {"success": True, 
                 "message": "Match Started",
                 "setup_rolls": rolls,
@@ -88,6 +100,7 @@ class Game:
         territory_names = list(self.territories.keys())
         random.shuffle(territory_names)
 
+        #add territories
         for index, terr_name in enumerate(territory_names):
 
             player_id = self.turn_order[index % len(self.turn_order)]
@@ -100,6 +113,7 @@ class Game:
             current_player.troops -= 1
 
     def calculate_reinforcements(self, player_id: int):
+        #get player territories and base troops
         player = self.players[player_id]
         owned_territories = [t for t in self.territories.values() if t.owner == player_id]
         base_troops = max(3, len(owned_territories)//3)
@@ -107,22 +121,39 @@ class Game:
         bonus_troops = 0
 
         for continent_name, bonus_value in CONTINENT_BONUS.items():
-
+            
+            #checks if owns all territories in a continent
             owns_a = all(
                 self.territories[t_name].owner == player_id
                 for t_name, t_data in MAP.items()
                 if t_data["continent"] == continent_name
             )
 
+            #if so add bonus
             if owns_a:
                 bonus_troops += bonus_value
 
         player.troops +=(base_troops + bonus_troops)
 
+    def _advance_setup_turn(self):
+        #if it isnt your turn
+        if not self.turn_order:
+            return False
 
+        #skip players that already placed all setup troops
+        for _ in range(len(self.turn_order)):
+            self.current_turn_index = (self.current_turn_index + 1) % len(self.turn_order)
+            next_player_id = self.turn_order[self.current_turn_index]
+            if self.players[next_player_id].troops > 0:
+                return True
+        
+        #gets here if everyone is with 0 troops
+        return False
 
     def deploy_troops(self, player_id: int, territory_name: str, amount: int = 1) -> dict:
-        
+        territory_name = self._canonical_territory_name(territory_name)
+
+
         if self.current_state not in [GameState.SETUP, GameState.DRAFT]:
             return {"error": "Incorrect phase to deploy troops"}
         
@@ -146,12 +177,9 @@ class Game:
 
         #state machine transition
         if self.current_state == GameState.SETUP:
-            
-            self.current_turn_index = (self.current_turn_index+1) % len(self.turn_order)
-
-            #check if all players placed all troops
-            all_placed = all(p.troops == 0 for p in self.players.values())
-            if all_placed:
+            #try to pass turn
+            has_next_player = self._advance_setup_turn()
+            if not has_next_player:
                 self.current_state = GameState.DRAFT
                 self.current_turn_index = 0
                 self.turn +=1
@@ -163,7 +191,7 @@ class Game:
         
         return {
             "success": True,
-            "territory": territory_name,
+            "territory": territory.name,
             "new_total": territory.troops,
             "troops_left": player.troops
         }
@@ -177,6 +205,9 @@ class Game:
         if self.turn_order[self.current_turn_index] != player_id:
             return {"error" : "Not your turn"}
         
+        origin_name = self._canonical_territory_name(origin_name)
+        target_name = self._canonical_territory_name(target_name)
+
         #getting origin and target territories
         origin = self.territories.get(origin_name)
         target = self.territories.get(target_name)
@@ -187,7 +218,7 @@ class Game:
             return {"error": "You don't own this territory"}
         if target.owner == player_id:
             return {"error": "You can't attack your own territory"}
-        if target_name not in origin.neighbors:
+        if target.name not in origin.neighbors:
             return {"error": "You can only attack adjacent territories"}
         
         #validating troops and dices
@@ -245,7 +276,7 @@ class Game:
             
         
         return {
-            "sucess": True,
+            "success": True,
             "attacker_rolls": atk_rolls,
             "defender_rolls": def_rolls,
             "attacker_losses": origin_losses,
@@ -277,6 +308,9 @@ class Game:
         if self.turn_order[self.current_turn_index] != player_id:
             return {"error": "Not your turn"}
         
+        origin_name = self._canonical_territory_name(origin_name)
+        target_name = self._canonical_territory_name(target_name)
+
         #movement and validation
         origin = self.territories.get(origin_name)
         target = self.territories.get(target_name)
@@ -285,7 +319,7 @@ class Game:
             return {"error": "Invalid territories"}
         if origin.owner != player_id or target.owner != player_id:
             return {"error": "You must own both territories"}
-        if target_name not in origin.neighbors:
+        if target.name not in origin.neighbors:
             return {"error": "Territories must be neighbours"}
         if origin.troops - amount <1:
             return {"error": "You must leave 1 troop behind"}
@@ -356,6 +390,53 @@ class Game:
         return {"game_over": False}
 
     #sync client
+    def get_player_territories(self, player_id: int) -> List[str]:
+        return [
+            territory.name
+            for territory in self.territories.values()
+            if territory.owner == player_id
+        ]
+
+    def get_player_attack_options(self, player_id: int) -> dict:
+        attack_options = {}
+
+        #gets all territories
+        for territory in self.territories.values():
+            #checks if the territory is from the player
+            if territory.owner != player_id or territory.troops <= 1:
+                continue
+            
+            #gets every neighbors that isnt from the player
+            enemy_neighbors = [
+                neighbor_name
+                for neighbor_name in territory.neighbors
+                if self.territories[neighbor_name].owner != player_id
+            ]
+
+            #if theres any enemy neighbors add to attack options
+            if enemy_neighbors:
+                attack_options[territory.name] = enemy_neighbors
+
+        return attack_options
+
+    def get_player_maneuver_options(self, player_id: int) -> dict:
+        maneuver_options = {}
+
+        for territory in self.territories.values():
+            if territory.owner != player_id or territory.troops <= 1:
+                continue
+
+            own_neighbors = [
+                neighbor_name
+                for neighbor_name in territory.neighbors
+                if self.territories[neighbor_name].owner == player_id
+            ]
+
+            if own_neighbors:
+                maneuver_options[territory.name] = own_neighbors
+
+        return maneuver_options
+
     def get_game_state(self):
 
         map_snap = {}
@@ -378,9 +459,24 @@ class Game:
         if self.turn_order and self.current_state != GameState.WAITING_PLAYERS:
             current_turn_id = self.turn_order[self.current_turn_index]
 
+        current_player_territories = []
+        current_player_attack_options = {}
+        current_player_maneuver_options = {}
+
+        if current_turn_id is not None:
+            current_player_territories = self.get_player_territories(current_turn_id)
+
+            if self.current_state == GameState.ATTACK:
+                current_player_attack_options = self.get_player_attack_options(current_turn_id)
+            elif self.current_state == GameState.MANEUVER:
+                current_player_maneuver_options = self.get_player_maneuver_options(current_turn_id)
+
         return {
             "current_state": self.current_state,
             "current_turn_id": current_turn_id,
             "map": map_snap,
-            "players": player_snap
+            "players": player_snap,
+            "current_player_territories": current_player_territories,
+            "current_player_attack_options": current_player_attack_options,
+            "current_player_maneuver_options": current_player_maneuver_options,
         }
