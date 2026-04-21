@@ -1,10 +1,17 @@
 from dataclasses import field, dataclass
 from typing import List, Optional
+from enum import Enum
 import random
+
+class CardSymbol(Enum):
+    INFANTRY = 1
+    CAVALRY = 2
+    ARTILLERY = 3
+    WILDCARD = 4
 
 @dataclass
 class Card:
-    symbol: str
+    symbol: CardSymbol #enum type
     description: str
     territory: Optional[str]
 

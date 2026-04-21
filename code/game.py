@@ -1,5 +1,5 @@
-from objects import Player, Territory
-from constants import MAP, GameState, INITIAL_ARMIES, CONTINENT_BONUS
+from objects import Player, Territory, Card, CardSymbol
+from constants import MAP, GameState, INITIAL_ARMIES, CONTINENT_BONUS, CARD_VALUES
 from typing import Dict, List
 import random
 
@@ -10,7 +10,11 @@ class Game:
         self.players: Dict[int, Player] = {}
         self.territories: Dict[str, Territory] = {}
         self._territory_aliases: Dict[str, str] = {}
-        #self.pack = List[Card] = {}
+
+        #cards and deck
+        self.deck: List[Card] = []
+        self.trade_count = 0 #count how much times a player traded
+        self.conquered_this_turn = False #flag to check if a player conquered in a turn
 
         #turn
         self.turn = 0
@@ -39,7 +43,7 @@ class Game:
         id = len(self.players)
         
         #player
-        self.players[id] = Player(id, player_name, color, None, 0)
+        self.players[id] = Player(id, player_name, color, 0, [])
         return {"success": True, "player_id": id, "color": color}
     
     def load_map(self, map_data: dict):
@@ -85,6 +89,20 @@ class Game:
         
         #distribute the territories
         self.distribute_initial_territories()
+
+        #generate cards and the deck
+        symbols = [CardSymbol.INFANTRY, CardSymbol.CAVALRY, CardSymbol.ARTILLERY]
+        territory_names = list(self.territories.keys())
+
+        for index, name in enumerate(territory_names):
+            actual_symbol = symbols[index % 3]
+            self.deck.append(Card(symbol=actual_symbol, description="", territory=name))
+        
+        #add wildcards
+        self.deck.append(Card(symbol=CardSymbol.WILDCARD, description="", territory=None))
+        self.deck.append(Card(symbol=CardSymbol.WILDCARD, description="", territory=None))
+        #randomize the deck
+        random.shuffle(self.deck)
 
         # setup phase starts right after match initialization
         self.current_state = GameState.SETUP
@@ -259,6 +277,7 @@ class Game:
         conquered = False
         if target.troops == 0:
             conquered = True
+            self.conquered_this_turn = True
             #old owner of the territory
             defender_id = target.owner
             target.owner = player_id
@@ -336,6 +355,16 @@ class Game:
         if self.turn_order[self.current_turn_index] != player_id:
             return {"error": "Not your turn"}
         
+        #giving card
+        card_drawn = None
+        if self.conquered_this_turn and len(self.deck) > 0:
+            drawn = self.deck.pop(0)
+            self.players[player_id].cards.append(drawn)
+            territory_name = drawn.territory if drawn.territory else "Wildcard"
+            card_drawn = f"{drawn.symbol.name} ({territory_name})"
+        
+        self.conquered_this_turn = False #resetting the flag
+        
         #advancing turn
         self.current_turn_index = (self.current_turn_index + 1) % len(self.turn_order)
         next_player_id = self.turn_order[self.current_turn_index]
@@ -350,7 +379,8 @@ class Game:
         return {
             "success": True,
             "message": "Turn ended",
-            "next_player": next_player_id
+            "next_player": next_player_id,
+            "card_earned": card_drawn
         }
 
     #checks
@@ -462,6 +492,7 @@ class Game:
         current_player_territories = []
         current_player_attack_options = {}
         current_player_maneuver_options = {}
+        current_player_cards = []
 
         if current_turn_id is not None:
             current_player_territories = self.get_player_territories(current_turn_id)
@@ -470,6 +501,14 @@ class Game:
                 current_player_attack_options = self.get_player_attack_options(current_turn_id)
             elif self.current_state == GameState.MANEUVER:
                 current_player_maneuver_options = self.get_player_maneuver_options(current_turn_id)
+            
+            active_player = self.players[current_turn_id]
+            for i, card in enumerate(active_player.cards):
+                current_player_cards.append({
+                    "index": i,
+                    "symbol": card.symbol.name,
+                    "territory": card.territory
+                })
 
         return {
             "current_state": self.current_state,
@@ -479,4 +518,85 @@ class Game:
             "current_player_territories": current_player_territories,
             "current_player_attack_options": current_player_attack_options,
             "current_player_maneuver_options": current_player_maneuver_options,
+            "current_player_cards": current_player_cards
+        }
+
+    #cards
+    def trade_cards(self, player_id: int, card_index: List[int]) -> dict:
+        '''
+        let the player trade 3 cards for troops in draft state
+        '''
+        #validating turn
+        if self.current_state != GameState.DRAFT:
+            return {"error": "You can only trade cards in DRAFT phase"}
+        if self.turn_order[self.current_turn_index] != player_id:
+            return {"error": "Not your turn"}
+        
+        #validating input
+        if len(card_index) != 3:
+            return {"error": "You must select 3 exactly cards to trade"}
+        if len(set(card_index)) != 3:
+            return {"error": "You cannot select the same card multiple times"}
+        if any(index < 0 for index in card_index):
+            return {"error": "Invalid cards"}
+        
+        player = self.players[player_id]
+        try:
+            selected_cards = [player.cards[i] for i in card_index]
+        except IndexError:
+            return {"error": "Invalid cards"}
+        
+        #validating the combo
+        symbols = [card.symbol for card in selected_cards]
+        is_valid_combo = False
+
+        #wildcard check
+        if CardSymbol.WILDCARD in symbols:
+            is_valid_combo = True
+        else:
+            #gets unique symbols
+            unique_symbols = len(set(symbols))
+            if unique_symbols == 1:
+                is_valid_combo = True # 3 of the same
+            elif unique_symbols == 3:
+                is_valid_combo = True # 1 of each type
+            
+        if not is_valid_combo:
+            return {"error": "The cards do not form a valid combo"}
+        
+        #if the combo is valid, trade the pieces
+        if self.trade_count < len(CARD_VALUES):
+            troops_gained = CARD_VALUES[self.trade_count]
+        else:
+            #after the 6th trade, increases from 5 to 5 (20,25 ...)
+            troops_gained = 15 + ((self.trade_count - 5) * 5)
+        
+        player.troops += troops_gained
+        self.trade_count += 1
+
+        #bonus from territory (+2 troops)
+        territory_bonus = None
+        for card in selected_cards:
+            if card.territory:
+                terr_canonical = self._canonical_territory_name(card.territory)
+                territory_obj = self.territories.get(terr_canonical)
+
+                #if the card territory belong to the player
+                if territory_obj and territory_obj.owner == player_id:
+                    territory_obj.troops +=2
+                    territory_bonus = territory_obj.name
+                    break #breaks the loop if the player has one
+        
+        #removes the card from the player
+        for index in sorted(card_index, reverse=True):
+            player.cards.pop(index)
+
+        self.deck.extend(selected_cards)
+
+        return {
+            "success": True,
+            "message": "Cards traded successfully!",
+            "troops_gained": troops_gained,
+            "bonus_territory": territory_bonus,
+            "new_troops_left": player.troops
         }
