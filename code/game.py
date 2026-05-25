@@ -6,6 +6,8 @@ import random
 class Game:
     def __init__(self,map_data: dict, max_players: int = 3):
         #initialization of map, states, players and variables
+        # keep a reference to the original map data for resets
+        self.map_data = map_data
         self.max_players = max_players
         self.players: Dict[int, Player] = {}
         self.territories: Dict[str, Territory] = {}
@@ -23,15 +25,63 @@ class Game:
 
         #state
         self.current_state: str = GameState.WAITING_PLAYERS
+        #shared event shown by the clients
+        self.last_event = None
 
         #colors
         self.available_colors = ["Red", "Blue", "Green", "Yellow", "Black", "Magenta"]
 
         self.load_map(map_data)
 
+    def start_new_match(self):
+        """Reset game internals but keep the registered players, then start a new match.
+
+        This allows reuse of the same players/colors to play a new round without
+        having to re-register clients.
+        """
+        # minimal reset of transient state
+        self.deck = []
+        self.trade_count = 0
+        self.conquered_this_turn = False
+        self.turn = 0
+        self.current_turn_index = 0
+        self.turn_order = []
+        self.last_event = None
+
+        # reset territories to initial map state
+        self.territories = {}
+        self._territory_aliases = {}
+        self.load_map(self.map_data)
+
+        # reset players' transient data but keep players list and colors
+        for player in self.players.values():
+            player.troops = 0
+            player.cards = []
+
+        # go to waiting state and attempt to start match using current players
+        self.current_state = GameState.WAITING_PLAYERS
+        return self.start_match()
+
     #getter and setter methods
     def register_player(self, player_name) -> dict:
         #security
+        # if a previous match finished, allow creating a new lobby automatically
+        if self.current_state == GameState.FINISHED:
+            # reset transient state and territories to prepare a new lobby
+            self.players = {}
+            self.deck = []
+            self.trade_count = 0
+            self.conquered_this_turn = False
+            self.turn = 0
+            self.current_turn_index = 0
+            self.turn_order = []
+            self.last_event = None
+            self.available_colors = ["Red", "Blue", "Green", "Yellow", "Black", "Magenta"]
+            self.territories = {}
+            self._territory_aliases = {}
+            self.load_map(self.map_data)
+            self.current_state = GameState.WAITING_PLAYERS
+
         if self.current_state != GameState.WAITING_PLAYERS:
             return {"error": "Game has already started"}
         
@@ -61,6 +111,18 @@ class Game:
         if territory_name is None:
             return None
         return self._territory_aliases.get(territory_name.strip().lower())
+
+    def _set_last_event(self, player_id: int | None, message: str):
+        #store the latest action so every client can display it
+        player_name = None
+        if player_id is not None and player_id in self.players:
+            player_name = self.players[player_id].name
+
+        self.last_event = {
+            "player_id": player_id,
+            "player_name": player_name,
+            "message": message,
+        }
 
     def start_match(self):
         player_count = len(self.players)
@@ -106,6 +168,9 @@ class Game:
 
         # setup phase starts right after match initialization
         self.current_state = GameState.SETUP
+        first_player = self.turn_order[self.current_turn_index]
+        #announce the first active turn to every client
+        self._set_last_event(None, f"Match started. First turn: {self.players[first_player].name}.")
 
         return {"success": True, 
                 "message": "Match Started",
@@ -203,9 +268,16 @@ class Game:
                 self.turn +=1
                 self.calculate_reinforcements(self.turn_order[self.current_turn_index])
 
+        placed_player_name = self.players[player_id].name
+        if self.current_state == GameState.SETUP:
+            #broadcast the setup placement
+            self._set_last_event(player_id, f"{placed_player_name} placed {amount} troop(s) in {territory.name}.")
+
         elif self.current_state == GameState.DRAFT:
             if player.troops == 0:
                 self.current_state = GameState.ATTACK
+            #broadcast the draft placement
+            self._set_last_event(player_id, f"{placed_player_name} placed {amount} troop(s) in {territory.name}.")
         
         return {
             "success": True,
@@ -292,6 +364,20 @@ class Game:
             victory_status = self.check_victory()
             if victory_status["game_over"]:
                 pass
+
+        attacker_name = self.players[player_id].name
+        if conquered:
+            #broadcast a successful conquest
+            self._set_last_event(
+                player_id,
+                f"{attacker_name} attacked {target.name} from {origin.name} and conquered it."
+            )
+        else:
+            #broadcast the attack result even when no territory was conquered
+            self._set_last_event(
+                player_id,
+                f"{attacker_name} attacked {target.name} from {origin.name}."
+            )
             
         
         return {
@@ -313,6 +399,9 @@ class Game:
             return {"error": "Not your turn"}
 
         self.current_state = GameState.MANEUVER
+
+        #broadcast the phase change
+        self._set_last_event(player_id, f"{self.players[player_id].name} ended the attack phase.")
 
         return {
             "success": True,
@@ -347,6 +436,9 @@ class Game:
         origin.troops -= amount
         target.troops += amount
 
+        #broadcast the troop movement before ending the turn
+        self._set_last_event(player_id, f"{self.players[player_id].name} moved {amount} troop(s) from {origin.name} to {target.name}.")
+
         return self.end_turn(player_id)
 
     #end turn
@@ -375,6 +467,14 @@ class Game:
 
         #calculating new troops
         self.calculate_reinforcements(next_player_id)
+
+        next_player_name = self.players[next_player_id].name if next_player_id in self.players else str(next_player_id)
+        current_player_name = self.players[player_id].name if player_id in self.players else str(player_id)
+        #broadcast the turn summary and the next active player
+        event_message = f"{current_player_name} ended the turn. Next player: {next_player_name}."
+        if card_drawn:
+            event_message += f" Card earned: {card_drawn}."
+        self._set_last_event(player_id, event_message)
 
         return {
             "success": True,
@@ -467,6 +567,49 @@ class Game:
 
         return maneuver_options
 
+    def get_player_state(self, player_id: int) -> dict:
+        player = self.players.get(player_id)
+        if player is None:
+            return {"error": "Invalid player"}
+
+        territories = []
+        for territory in self.territories.values():
+            if territory.owner == player_id:
+                territories.append({
+                    "name": territory.name,
+                    "troops": territory.troops,
+                })
+
+        cards = []
+        for index, card in enumerate(player.cards):
+            cards.append({
+                "index": index,
+                "symbol": card.symbol.name,
+                "territory": card.territory,
+            })
+
+        continents = []
+        for continent_name in CONTINENT_BONUS.keys():
+            owns_all = all(
+                self.territories[territory_name].owner == player_id
+                for territory_name, territory_data in MAP.items()
+                if territory_data["continent"] == continent_name
+            )
+            if owns_all:
+                continents.append(continent_name)
+
+        return {
+            "player_id": player_id,
+            "name": player.name,
+            "color": player.color,
+            "troops_to_place": player.troops,
+            "territories": territories,
+            "cards": cards,
+            "continents": continents,
+            "territory_count": len(territories),
+            "card_count": len(cards),
+        }
+
     def get_game_state(self):
 
         map_snap = {}
@@ -513,12 +656,18 @@ class Game:
         return {
             "current_state": self.current_state,
             "current_turn_id": current_turn_id,
+            #clients use this to show who is playing now
+            "current_turn_player_name": self.players[current_turn_id].name if current_turn_id is not None and current_turn_id in self.players else None,
             "map": map_snap,
             "players": player_snap,
             "current_player_territories": current_player_territories,
             "current_player_attack_options": current_player_attack_options,
             "current_player_maneuver_options": current_player_maneuver_options,
-            "current_player_cards": current_player_cards
+            "current_player_cards": current_player_cards,
+            #shared event for all connected clients
+            "last_event": self.last_event,
+            #if the game ended, include victory info
+            "victory": self.check_victory(),
         }
 
     #cards
