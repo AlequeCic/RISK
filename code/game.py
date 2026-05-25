@@ -670,6 +670,50 @@ class Game:
             "victory": self.check_victory(),
         }
 
+    def unregister_player(self, player_id: int) -> dict:
+        """Remove a player from the lobby. Frees color and adjusts turn order.
+
+        If the removal leaves fewer than 2 players, the game returns to WAITING_PLAYERS
+        so remaining players can form a new match.
+        """
+        if player_id not in self.players:
+            return {"error": "Invalid player id"}
+
+        color = self.players[player_id].color
+        # remove player
+        del self.players[player_id]
+
+        # return color to pool
+        if color not in self.available_colors:
+            self.available_colors.append(color)
+
+        # remove from turn order if present
+        if player_id in self.turn_order:
+            self.turn_order = [pid for pid in self.turn_order if pid != player_id]
+            if self.turn_order:
+                self.current_turn_index = self.current_turn_index % len(self.turn_order)
+            else:
+                self.current_turn_index = 0
+
+        # if not enough players remain, reset transient match state
+        if len(self.players) < 2:
+            self.current_state = GameState.WAITING_PLAYERS
+            self.deck = []
+            self.trade_count = 0
+            self.conquered_this_turn = False
+            self.turn = 0
+            self.current_turn_index = 0
+            self.turn_order = []
+            # reset territories to initial map
+            self.territories = {}
+            self._territory_aliases = {}
+            self.load_map(self.map_data)
+            for p in self.players.values():
+                p.troops = 0
+                p.cards = []
+
+        return {"success": True}
+
     #cards
     def trade_cards(self, player_id: int, card_index: List[int]) -> dict:
         '''
