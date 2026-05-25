@@ -55,10 +55,6 @@ code/
 		test_game.py
 docs/
 	arquitetura-modulos.md
-pyro_tutorial/
-	client_text.py
-	README.md
-	server_text.py
 ```
 
 ## Requisitos
